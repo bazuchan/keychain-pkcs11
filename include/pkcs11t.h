@@ -945,6 +945,9 @@ typedef CK_ULONG          CK_MECHANISM_TYPE;
 
 #define CKM_ECDSA                      0x00001041
 #define CKM_ECDSA_SHA1                 0x00001042
+#define CKM_ECDSA_SHA256               0x00001043
+#define CKM_ECDSA_SHA384               0x00001044
+#define CKM_ECDSA_SHA512               0x00001045
 
 /* CKM_ECDH1_DERIVE, CKM_ECDH1_COFACTOR_DERIVE, and CKM_ECMQV_DERIVE
  * are new for v2.11 */

@@ -2,6 +2,15 @@
  * Glue routines to interface with the Apple CommonCrypto framework
  */
 
+/*
+ * The low-level CC_SHA*_Init/Update/Final functions are deprecated in
+ * newer SDKs.  We use them intentionally — there is no direct C-level
+ * replacement that fits our existing calling convention without a larger
+ * refactor.
+ */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #include <CommonCrypto/CommonCrypto.h>
 
 #include "mypkcs11.h"
@@ -132,3 +141,5 @@ cc_md_final(md_context context, unsigned char **ret_data,
 	*ret_data = d;
 	*ret_len = len;
 }
+
+#pragma clang diagnostic pop

@@ -1,3 +1,5 @@
+## Thist fork adds support for ecdsa keys. Can be used with https://gist.github.com/arianvp/5f59f1783e3eaf1a2d4cd8e952bb4acf
+
 # Keychain-PKCS11
 
 This is a library designed to bridge the gap between the Apple Security

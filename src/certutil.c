@@ -2,6 +2,14 @@
  * Utility routines for dealing with various things about certificates
  */
 
+/*
+ * We intentionally use the deprecated SecAsn1 APIs here; there is no
+ * modern replacement that provides the same low-level DER decoding
+ * capabilities we need for parsing certificate fields.
+ */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
 #include <Security/SecCertificate.h>
@@ -352,6 +360,348 @@ get_pubkey_info(CFDataRef pubkeydata, CFDataRef *modulus, CFDataRef *exponent)
 }
 
 /*
+ * Minimal DER helpers used by get_ec_pubkey_from_cert().
+ *
+ * der_skip_tlv: skip one complete TLV, return pointer to the next TLV.
+ * der_enter_tlv: verify tag, return pointer to the VALUE, set *lenp.
+ * Both return NULL on any error.
+ */
+
+static const uint8_t *
+der_skip_tlv(const uint8_t *p, const uint8_t *end)
+{
+	if (p >= end) return NULL;
+	p++;			/* tag */
+	if (p >= end) return NULL;
+	size_t len;
+	if (*p & 0x80) {
+		int nb = *p++ & 0x7f;
+		if (nb == 0 || nb > 4 || p + nb > end) return NULL;
+		len = 0;
+		for (int i = 0; i < nb; i++) len = (len << 8) | *p++;
+	} else {
+		len = *p++;
+	}
+	if (p + len > end) return NULL;
+	return p + len;
+}
+
+static const uint8_t *
+der_enter_tlv(const uint8_t *p, const uint8_t *end, uint8_t tag, size_t *lenp)
+{
+	if (p >= end || *p != tag) return NULL;
+	p++;
+	if (p >= end) return NULL;
+	size_t len;
+	if (*p & 0x80) {
+		int nb = *p++ & 0x7f;
+		if (nb == 0 || nb > 4 || p + nb > end) return NULL;
+		len = 0;
+		for (int i = 0; i < nb; i++) len = (len << 8) | *p++;
+	} else {
+		len = *p++;
+	}
+	if (p + len > end) return NULL;
+	if (lenp) *lenp = len;
+	return p;
+}
+
+/*
+ * Extract CKA_EC_PARAMS and CKA_EC_POINT directly from the DER-encoded
+ * certificate by walking the SubjectPublicKeyInfo field.
+ *
+ * Used as a fallback when SecKeyCopyExternalRepresentation fails for
+ * CTK-backed (hardware token) public keys.
+ *
+ * The SubjectPublicKeyInfo for an EC key looks like:
+ *
+ *   SEQUENCE {
+ *     SEQUENCE {                          -- AlgorithmIdentifier
+ *       OID 1.2.840.10045.2.1            -- id-ecPublicKey
+ *       OID <curve>                       -- named curve (CKA_EC_PARAMS)
+ *     }
+ *     BIT STRING { 00 04 X Y... }        -- uncompressed point
+ *   }
+ *
+ * Returns true on success; caller must CFRelease the returned CFDataRefs.
+ */
+
+bool
+get_ec_pubkey_from_cert(SecCertificateRef cert, CFDataRef *ec_params,
+			CFDataRef *ec_point)
+{
+	CFDataRef certdata = SecCertificateCopyData(cert);
+	if (!certdata) {
+		os_log_error(logsys, "get_ec_pubkey_from_cert: "
+			     "SecCertificateCopyData failed");
+		return false;
+	}
+
+	const uint8_t *p   = CFDataGetBytePtr(certdata);
+	const uint8_t *end = p + CFDataGetLength(certdata);
+	size_t len;
+	bool result = false;
+	uint8_t *der = NULL;
+
+	/* Enter Certificate SEQUENCE */
+	p = der_enter_tlv(p, end, 0x30, &len);
+	if (!p) { os_log_error(logsys, "get_ec_pubkey_from_cert: "
+		  "failed at Certificate SEQUENCE"); goto out; }
+	end = p + len;
+
+	/* Enter TBSCertificate SEQUENCE */
+	p = der_enter_tlv(p, end, 0x30, &len);
+	if (!p) { os_log_error(logsys, "get_ec_pubkey_from_cert: "
+		  "failed at TBSCertificate SEQUENCE"); goto out; }
+	const uint8_t *tbs_end = p + len;
+
+	/* Skip optional version [0] EXPLICIT */
+	if (p < tbs_end && *p == 0xA0) {
+		p = der_skip_tlv(p, tbs_end);
+		if (!p) { os_log_error(logsys, "get_ec_pubkey_from_cert: "
+			  "failed skipping version"); goto out; }
+	}
+
+	/* Skip serialNumber, signature AlgorithmIdentifier, issuer, validity,
+	 * subject — five consecutive TLVs. */
+	for (int i = 0; i < 5; i++) {
+		p = der_skip_tlv(p, tbs_end);
+		if (!p) { os_log_error(logsys, "get_ec_pubkey_from_cert: "
+			  "failed skipping TLV %d", i); goto out; }
+	}
+
+	/* Now at SubjectPublicKeyInfo SEQUENCE */
+	p = der_enter_tlv(p, tbs_end, 0x30, &len);
+	if (!p) { os_log_error(logsys, "get_ec_pubkey_from_cert: "
+		  "failed at SPKI SEQUENCE (tag=0x%02x)", p ? *p : 0);
+		  goto out; }
+	const uint8_t *spki_end = p + len;
+
+	/* Enter AlgorithmIdentifier SEQUENCE */
+	p = der_enter_tlv(p, spki_end, 0x30, &len);
+	if (!p) { os_log_error(logsys, "get_ec_pubkey_from_cert: "
+		  "failed at AlgorithmIdentifier"); goto out; }
+	const uint8_t *alg_end = p + len;	/* also = start of BIT STRING TLV */
+
+	/* Skip algorithm OID (id-ecPublicKey 1.2.840.10045.2.1) */
+	p = der_skip_tlv(p, alg_end);
+	if (!p) { os_log_error(logsys, "get_ec_pubkey_from_cert: "
+		  "failed skipping algorithm OID"); goto out; }
+
+	/* parameters = curve OID TLV; we want the full TLV for CKA_EC_PARAMS */
+	if (p >= alg_end || *p != 0x06) {
+		os_log_error(logsys, "get_ec_pubkey_from_cert: "
+			     "expected curve OID (0x06) but got 0x%02x",
+			     (p < alg_end) ? *p : 0xff);
+		goto out;
+	}
+	const uint8_t *curve_oid_tlv = p;
+	size_t oid_val_len;
+	p = der_enter_tlv(p, alg_end, 0x06, &oid_val_len);
+	if (!p) { os_log_error(logsys, "get_ec_pubkey_from_cert: "
+		  "failed entering curve OID"); goto out; }
+	/* full OID TLV = curve_oid_tlv .. (p + oid_val_len) */
+	*ec_params = CFDataCreate(kCFAllocatorDefault, curve_oid_tlv,
+				  (p + oid_val_len) - curve_oid_tlv);
+	if (!*ec_params) goto out;
+
+	/* BIT STRING starts at alg_end */
+	p = der_enter_tlv(alg_end, spki_end, 0x03, &len);
+	if (!p || len < 2) {
+		os_log_error(logsys, "get_ec_pubkey_from_cert: "
+			     "failed at BIT STRING");
+		goto rel_params;
+	}
+
+	/* First byte of BIT STRING value = unused-bits count; must be 0 */
+	if (*p != 0x00) {
+		os_log_error(logsys, "get_ec_pubkey_from_cert: "
+			     "unexpected unused-bits byte 0x%02x", *p);
+		goto rel_params;
+	}
+	p++;
+	len--;
+
+	/* Remaining bytes = X9.62 uncompressed point: 04 X Y ... */
+	if (len < 2 || *p != 0x04) {
+		os_log_error(logsys, "get_ec_pubkey_from_cert: "
+			     "expected uncompressed point (0x04) but got "
+			     "0x%02x len=%ld", *p, (long) len);
+		goto rel_params;
+	}
+
+	/* Wrap in DER OCTET STRING for CKA_EC_POINT */
+	{
+		size_t der_len;
+		if (len < 128) {
+			der_len = 2 + len;
+			der = malloc(der_len);
+			if (!der) goto rel_params;
+			der[0] = 0x04;
+			der[1] = (uint8_t) len;
+			memcpy(der + 2, p, len);
+		} else {
+			der_len = 3 + len;
+			der = malloc(der_len);
+			if (!der) goto rel_params;
+			der[0] = 0x04;
+			der[1] = 0x81;
+			der[2] = (uint8_t) len;
+			memcpy(der + 3, p, len);
+		}
+
+		*ec_point = CFDataCreate(kCFAllocatorDefault, der, der_len);
+		free(der);
+		der = NULL;
+
+		if (!*ec_point) goto rel_params;
+	}
+
+	os_log_error(logsys, "get_ec_pubkey_from_cert: success, "
+		     "point len=%ld", (long) len);
+	result = true;
+	goto out;
+
+rel_params:
+	CFRelease(*ec_params);
+	*ec_params = NULL;
+
+out:
+	CFRelease(certdata);
+	return result;
+}
+
+/*
+ * Build CKA_EC_PARAMS and CKA_EC_POINT for an EC public key.
+ *
+ * Apple's SecKeyCopyExternalRepresentation() for EC public keys returns the
+ * raw uncompressed X9.62 point: 0x04 || X || Y.  blocksize is the value
+ * returned by SecKeyGetBlockSize() for the key (the field element size in
+ * bytes: 32 for P-256, 48 for P-384, 66 for P-521).
+ *
+ * CKA_EC_PARAMS is set to the DER-encoded OID of the named curve.
+ * CKA_EC_POINT is set to a DER OCTET STRING wrapping the X9.62 point.
+ */
+
+bool
+get_ec_pubkey_info(CFDataRef pubkeydata, size_t blocksize,
+		   CFDataRef *ec_params, CFDataRef *ec_point)
+{
+	/* DER-encoded OIDs for NIST named curves */
+	static const unsigned char p256_oid[] = {	/* 1.2.840.10045.3.1.7 */
+		0x06, 0x08,
+		0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07
+	};
+	static const unsigned char p384_oid[] = {	/* 1.3.132.0.34 */
+		0x06, 0x05,
+		0x2B, 0x81, 0x04, 0x00, 0x22
+	};
+	static const unsigned char p521_oid[] = {	/* 1.3.132.0.35 */
+		0x06, 0x05,
+		0x2B, 0x81, 0x04, 0x00, 0x23
+	};
+
+	const unsigned char *oid;
+	size_t oid_len;
+	const uint8_t *point;
+	size_t point_len;
+	uint8_t *der;
+	size_t der_len;
+
+	/*
+	 * Detect the curve from the external representation data length.
+	 * SecKeyCopyExternalRepresentation returns the X9.62 uncompressed
+	 * point: 04 || X || Y.  Lengths: P-256=65, P-384=97, P-521=133.
+	 *
+	 * We prefer data-length detection over blocksize because for CTK
+	 * (smartcard) keys SecKeyGetBlockSize may return the max DER
+	 * signature size rather than the field-element size.
+	 */
+	point_len = (size_t) CFDataGetLength(pubkeydata);
+
+	switch (point_len) {
+	case 65:	/* P-256: 1 + 2*32 */
+		oid = p256_oid;
+		oid_len = sizeof(p256_oid);
+		break;
+	case 97:	/* P-384: 1 + 2*48 */
+		oid = p384_oid;
+		oid_len = sizeof(p384_oid);
+		break;
+	case 133:	/* P-521: 1 + 2*66 */
+		oid = p521_oid;
+		oid_len = sizeof(p521_oid);
+		break;
+	default:
+		/*
+		 * Fall back to blocksize-based detection for non-standard
+		 * representations.
+		 */
+		switch (blocksize) {
+		case 32:
+			oid = p256_oid;
+			oid_len = sizeof(p256_oid);
+			break;
+		case 48:
+			oid = p384_oid;
+			oid_len = sizeof(p384_oid);
+			break;
+		case 66:
+			oid = p521_oid;
+			oid_len = sizeof(p521_oid);
+			break;
+		default:
+			return false;
+		}
+		break;
+	}
+
+	*ec_params = CFDataCreate(kCFAllocatorDefault, oid, oid_len);
+	if (! *ec_params)
+		return false;
+
+	/* Wrap the raw X9.62 point in a DER OCTET STRING (tag 0x04) */
+	point = CFDataGetBytePtr(pubkeydata);
+	point_len = (size_t) CFDataGetLength(pubkeydata);
+
+	if (point_len < 128) {
+		der_len = 2 + point_len;
+		der = malloc(der_len);
+		if (! der) {
+			CFRelease(*ec_params);
+			*ec_params = NULL;
+			return false;
+		}
+		der[0] = 0x04;			/* OCTET STRING tag */
+		der[1] = (uint8_t) point_len;
+		memcpy(der + 2, point, point_len);
+	} else {
+		der_len = 3 + point_len;
+		der = malloc(der_len);
+		if (! der) {
+			CFRelease(*ec_params);
+			*ec_params = NULL;
+			return false;
+		}
+		der[0] = 0x04;			/* OCTET STRING tag */
+		der[1] = 0x81;			/* long-form length, 1 byte */
+		der[2] = (uint8_t) point_len;
+		memcpy(der + 3, point, point_len);
+	}
+
+	*ec_point = CFDataCreate(kCFAllocatorDefault, der, der_len);
+	free(der);
+
+	if (! *ec_point) {
+		CFRelease(*ec_params);
+		*ec_params = NULL;
+		return false;
+	}
+
+	return true;
+}
+
+/*
  * Return 'true' if the given certificate is a CA.
  *
  * The following things have to be true for a cert to be a CA:
@@ -513,3 +863,5 @@ out:
 
 	return is_ca;
 }
+
+#pragma clang diagnostic pop

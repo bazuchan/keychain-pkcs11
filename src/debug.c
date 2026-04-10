@@ -272,6 +272,9 @@ const char * getCKMName(CK_MECHANISM_TYPE mech) {
         case CKM_ECDSA_KEY_PAIR_GEN: return "CKM_ECDSA_KEY_PAIR_GEN";
         case CKM_ECDSA: return "CKM_ECDSA";
         case CKM_ECDSA_SHA1: return "CKM_ECDSA_SHA1";
+        case CKM_ECDSA_SHA256: return "CKM_ECDSA_SHA256";
+        case CKM_ECDSA_SHA384: return "CKM_ECDSA_SHA384";
+        case CKM_ECDSA_SHA512: return "CKM_ECDSA_SHA512";
         case CKM_ECDH1_DERIVE: return "CKM_ECDH1_DERIVE";
         case CKM_ECDH1_COFACTOR_DERIVE: return "CKM_ECDH1_COFACTOR_DERIVE";
         case CKM_ECMQV_DERIVE: return "CKM_ECMQV_DERIVE";

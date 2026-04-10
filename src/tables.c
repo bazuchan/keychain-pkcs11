@@ -151,6 +151,54 @@ const struct mechanism_map keychain_mechmap[] = {
 	  NULL, 0,	/* Another special case; no digest algorithm */
 	  true,
 	},
+	/*
+	 * ECDSA mechanisms.  CKM_ECDSA takes a pre-hashed digest directly.
+	 * The SHA variants digest the message before signing.
+	 *
+	 * Note: blocksize_out is false because SecKeyGetBlockSize() for EC
+	 * keys returns the field element size, not the DER signature size.
+	 * The actual signature output size is computed in C_SignInit.
+	 */
+	{
+	  CKM_ECDSA, 256, 521,
+	  CKF_HW|CKF_SIGN|CKF_VERIFY, NONE,
+	  NULL,
+	  &kSecKeyAlgorithmECDSASignatureDigestX962,
+	  NULL, 0,
+	  false,
+	},
+	{
+	  CKM_ECDSA_SHA1, 256, 521,
+	  CKF_HW|CKF_SIGN|CKF_VERIFY, NONE,
+	  NULL,
+	  &kSecKeyAlgorithmECDSASignatureMessageX962SHA1,
+	  &kSecKeyAlgorithmECDSASignatureDigestX962SHA1,
+	  CKM_SHA_1, false,
+	},
+	{
+	  CKM_ECDSA_SHA256, 256, 521,
+	  CKF_HW|CKF_SIGN|CKF_VERIFY, NONE,
+	  NULL,
+	  &kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
+	  &kSecKeyAlgorithmECDSASignatureDigestX962SHA256,
+	  CKM_SHA256, false,
+	},
+	{
+	  CKM_ECDSA_SHA384, 256, 521,
+	  CKF_HW|CKF_SIGN|CKF_VERIFY, NONE,
+	  NULL,
+	  &kSecKeyAlgorithmECDSASignatureMessageX962SHA384,
+	  &kSecKeyAlgorithmECDSASignatureDigestX962SHA384,
+	  CKM_SHA384, false,
+	},
+	{
+	  CKM_ECDSA_SHA512, 256, 521,
+	  CKF_HW|CKF_SIGN|CKF_VERIFY, NONE,
+	  NULL,
+	  &kSecKeyAlgorithmECDSASignatureMessageX962SHA512,
+	  &kSecKeyAlgorithmECDSASignatureDigestX962SHA512,
+	  CKM_SHA512, false,
+	},
 };
 
 const unsigned int keychain_mechmap_size = sizeof(keychain_mechmap) /

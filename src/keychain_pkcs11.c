@@ -36,6 +36,7 @@
 #include <stdarg.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <dlfcn.h>
 
 #include "mypkcs11.h"
 #include "keychain_pkcs11.h"
@@ -46,6 +47,23 @@
 #include "debug.h"
 #include "tables.h"
 #include "config.h"
+
+/*
+ * Prevent dlclose() from unmapping our library while LocalAuthentication's
+ * LAClient may still hold ObjC object pointers into our __DATA section and
+ * run async cleanup callbacks (on la_client queue) after we've returned from
+ * C_Finalize.  RTLD_NODELETE keeps our pages mapped for the life of the
+ * process; the process exits immediately after SSH finishes anyway, so this
+ * is not a real leak.
+ */
+__attribute__((constructor))
+static void
+prevent_unload(void)
+{
+	Dl_info info;
+	if (dladdr((void *) prevent_unload, &info) && info.dli_fname)
+		dlopen(info.dli_fname, RTLD_LAZY | RTLD_NODELETE);
+}
 
 /* We currently support 2.40 of Cryptoki */
 
@@ -363,6 +381,7 @@ struct session {
 	SecKeyAlgorithm dalg;			/* Algorithm, takes digest */
 	CK_MECHANISM_TYPE hash_alg;		/* Hash algorithm */
 	md_context	mdc;			/* Message digest context */
+	bool		ec_sig;			/* True if ECDSA (raw r||s fmt) */
 };
 
 static struct session **sess_list = NULL;	/* Yes, array of pointers */
@@ -702,9 +721,14 @@ CK_RV C_Finalize(CK_VOID_PTR p)
 	}
 
 	/*
-	 * Before anything else happens, stop receiving token watcher
-	 * events
+	 * Mark as uninitialized FIRST, before stopping the token watcher.
+	 * CTK dispatches removal callbacks asynchronously; any callback
+	 * already queued will check module_initialized and bail out early
+	 * in remove_token_id() rather than touching freed slot state.
 	 */
+	use_mutex = 0;
+	module_initialized = 0;
+	cert_slot_enabled = 0;
 
 	stop_token_watcher();
 
@@ -727,10 +751,6 @@ CK_RV C_Finalize(CK_VOID_PTR p)
 		obj_free(&cert_obj_list, &cert_obj_count, &cert_obj_size);
 		cert_list_free();
 	}
-
-	use_mutex = 0;
-	module_initialized = 0;
-	cert_slot_enabled = 0;
 
 	RET(C_Finalize, CKR_OK);
 }
@@ -1492,7 +1512,11 @@ CK_RV C_GetAttributeValue(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE object,
 				}
 			}
 		} else {
-			os_log_debug(logsys, "Attribute not found");
+			os_log_debug(logsys, "Attribute %{public}s (0x%lx) "
+				     "not found on %{public}s object",
+				     getCKAName(template[i].type),
+				     (unsigned long) template[i].type,
+				     getCKOName(se->obj_list[object].class));
 			template[i].ulValueLen = CK_UNAVAILABLE_INFORMATION;
 			rv = CKR_ATTRIBUTE_TYPE_INVALID;
 		}
@@ -2057,6 +2081,150 @@ NOTSUPPORTED(C_DigestKey, (CK_SESSION_HANDLE session, CK_OBJECT_HANDLE key))
 NOTSUPPORTED(C_DigestFinal, (CK_SESSION_HANDLE session, CK_BYTE_PTR digest, CK_ULONG_PTR digestlen))
 
 /*
+ * PKCS#11 CKM_ECDSA* mechanisms require signatures in raw r||s form
+ * (each integer zero-padded to the field element size), but Apple's
+ * Security framework uses DER-encoded X9.62 SEQUENCE { INTEGER r, s }.
+ * The two functions below convert between these formats.
+ */
+
+/*
+ * Convert Apple DER ECDSA signature to PKCS#11 raw r||s.
+ * field_size is SecKeyGetBlockSize() for the key (e.g. 32 for P-256).
+ * Returns NULL on parse error; caller must CFRelease the result.
+ */
+static CFDataRef
+ecdsa_der_to_raw(CFDataRef dersig, size_t field_size)
+{
+	const uint8_t *der = CFDataGetBytePtr(dersig);
+	size_t derlen = (size_t) CFDataGetLength(dersig);
+	size_t pos = 0;
+	uint8_t *raw;
+	CFDataRef out;
+
+	/* Outer SEQUENCE tag */
+	if (pos >= derlen || der[pos++] != 0x30)
+		return NULL;
+
+	/* Outer SEQUENCE length (skip; not strictly needed) */
+	if (pos >= derlen)
+		return NULL;
+	if (der[pos] & 0x80)
+		pos += 1 + (der[pos] & 0x7f);
+	else
+		pos++;
+
+	raw = calloc(2, field_size);
+	if (! raw)
+		return NULL;
+
+	/* Parse r and s integers */
+	for (int i = 0; i < 2; i++) {
+		size_t dst = (size_t) i * field_size;
+		size_t intlen;
+
+		if (pos >= derlen || der[pos++] != 0x02)
+			goto fail;
+
+		if (pos >= derlen)
+			goto fail;
+		intlen = der[pos++];
+
+		if (pos + intlen > derlen)
+			goto fail;
+
+		/* Strip the DER sign byte (leading 0x00) if present */
+		if (intlen > 0 && der[pos] == 0x00) {
+			pos++;
+			intlen--;
+		}
+
+		if (intlen > field_size)
+			goto fail;
+
+		/* Right-align into output (zero-pad on the left) */
+		memcpy(raw + dst + (field_size - intlen), der + pos, intlen);
+		pos += intlen;
+	}
+
+	out = CFDataCreate(kCFAllocatorDefault, raw, 2 * field_size);
+	free(raw);
+	return out;
+
+fail:
+	free(raw);
+	return NULL;
+}
+
+/*
+ * Convert PKCS#11 raw r||s ECDSA signature to Apple DER format.
+ * rawlen must be even; field_size = rawlen / 2.
+ * Returns NULL on error; caller must CFRelease the result.
+ */
+static CFDataRef
+ecdsa_raw_to_der(const uint8_t *raw, size_t rawlen)
+{
+	size_t field_size, rstart, sstart, rlen, slen;
+	int r_pad, s_pad;
+	size_t inner_len, hdr_len, der_len;
+	uint8_t *der;
+	size_t pos = 0;
+	CFDataRef out;
+
+	if (rawlen == 0 || rawlen % 2 != 0)
+		return NULL;
+
+	field_size = rawlen / 2;
+	const uint8_t *r = raw;
+	const uint8_t *s = raw + field_size;
+
+	/* Skip leading zero bytes, but keep at least one byte */
+	for (rstart = 0; rstart < field_size - 1 && r[rstart] == 0; rstart++)
+		;
+	for (sstart = 0; sstart < field_size - 1 && s[sstart] == 0; sstart++)
+		;
+
+	rlen = field_size - rstart;
+	slen = field_size - sstart;
+
+	/* DER INTEGER requires a leading 0x00 if the high bit is set */
+	r_pad = (r[rstart] & 0x80) ? 1 : 0;
+	s_pad = (s[sstart] & 0x80) ? 1 : 0;
+
+	inner_len = 2 + rlen + r_pad + 2 + slen + s_pad;
+	hdr_len   = (inner_len >= 128) ? 3 : 2;
+	der_len   = hdr_len + inner_len;
+
+	der = malloc(der_len);
+	if (! der)
+		return NULL;
+
+	/* SEQUENCE */
+	der[pos++] = 0x30;
+	if (inner_len >= 128) {
+		der[pos++] = 0x81;
+		der[pos++] = (uint8_t) inner_len;
+	} else {
+		der[pos++] = (uint8_t) inner_len;
+	}
+
+	/* INTEGER r */
+	der[pos++] = 0x02;
+	der[pos++] = (uint8_t)(rlen + r_pad);
+	if (r_pad) der[pos++] = 0x00;
+	memcpy(der + pos, r + rstart, rlen); pos += rlen;
+
+	/* INTEGER s */
+	der[pos++] = 0x02;
+	der[pos++] = (uint8_t)(slen + s_pad);
+	if (s_pad) der[pos++] = 0x00;
+	memcpy(der + pos, s + sstart, slen); pos += slen;
+
+	out = CFDataCreate(kCFAllocatorDefault, der, pos);
+	free(der);
+	return out;
+}
+
+/*
  * Start a signature operation.  Our global assumption is that the signature
  * is only done with a private key; if that changes then we need to change
  * this code.
@@ -2145,8 +2313,15 @@ CK_RV C_SignInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mech,
 	CFRetain(se->key);
 	UNLOCK_MUTEX(se->token->entry_mutex);
 
+	se->ec_sig = (se->obj_list[object].id->keytype == CKK_EC);
+
 	if (mm->blocksize_out) {
 		se->outsize = SecKeyGetBlockSize(se->key);
+	} else if (se->ec_sig) {
+		/*
+		 * PKCS#11 raw r||s output: exactly 2 * field_size bytes.
+		 */
+		se->outsize = SecKeyGetBlockSize(se->key) * 2;
 	} else {
 		se->outsize = 0;
 	}
@@ -2250,6 +2425,25 @@ CK_RV C_Sign(CK_SESSION_HANDLE session, CK_BYTE_PTR indata, CK_ULONG indatalen,
 		se->state = NO_PENDING;
 		UNLOCK_MUTEX(se->mutex);
 		RET(C_Sign, CKR_GENERAL_ERROR);
+	}
+
+	/*
+	 * PKCS#11 CKM_ECDSA* returns raw r||s; convert from Apple's DER.
+	 */
+	if (se->ec_sig) {
+		CFDataRef rawref = ecdsa_der_to_raw(outref,
+					SecKeyGetBlockSize(se->key));
+		CFRelease(outref);
+		outref = rawref;
+		if (! outref) {
+			os_log_debug(logsys, "ecdsa_der_to_raw conversion failed");
+			CFRelease(se->key);
+			se->key = NULL;
+			se->outsize = 0;
+			se->state = NO_PENDING;
+			UNLOCK_MUTEX(se->mutex);
+			RET(C_Sign, CKR_GENERAL_ERROR);
+		}
 	}
 
 	if (*siglen < CFDataGetLength(outref)) {
@@ -2470,6 +2664,21 @@ CK_RV C_SignFinal(CK_SESSION_HANDLE session, CK_BYTE_PTR sig,
 		goto outfinish;
 	}
 
+	/*
+	 * PKCS#11 CKM_ECDSA* returns raw r||s; convert from Apple's DER.
+	 */
+	if (se->ec_sig) {
+		CFDataRef rawout = ecdsa_der_to_raw(sigout,
+					SecKeyGetBlockSize(se->key));
+		CFRelease(sigout);
+		sigout = rawout;
+		if (! sigout) {
+			os_log_debug(logsys, "ecdsa_der_to_raw conversion failed");
+			rv = CKR_FUNCTION_FAILED;
+			goto outfinish;
+		}
+	}
+
 	if (*siglen < CFDataGetLength(sigout)) {
 		/*
 		 * This shouldn't happen, but if it does treat it
@@ -2498,6 +2707,7 @@ outfinish:
 	se->dalg = NULL;
 	se->alg = NULL;
 	se->outsize = 0;
+	se->ec_sig = false;
 	se->state = NO_PENDING;
 
 out:
@@ -2585,8 +2795,12 @@ CK_RV C_VerifyInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mech,
 	se->key = se->obj_list[key].id->pubkey;
 	CFRetain(se->key);
 
+	se->ec_sig = (se->obj_list[key].id->keytype == CKK_EC);
+
 	if (mm->blocksize_out) {
 		se->outsize = SecKeyGetBlockSize(se->key);
+	} else if (se->ec_sig) {
+		se->outsize = SecKeyGetBlockSize(se->key) * 2;
 	} else {
 		se->outsize = 0;
 	}
@@ -2625,8 +2839,26 @@ CK_RV C_Verify(CK_SESSION_HANDLE session, CK_BYTE_PTR indata,
 
 	inref = CFDataCreateWithBytesNoCopy(NULL, indata, indatalen,
 					    kCFAllocatorNull);
-	sigref = CFDataCreateWithBytesNoCopy(NULL, sig, siglen,
-					     kCFAllocatorNull);
+
+	/*
+	 * PKCS#11 supplies ECDSA signatures as raw r||s; convert to
+	 * Apple's DER format before calling SecKeyVerifySignature.
+	 */
+	if (se->ec_sig) {
+		sigref = ecdsa_raw_to_der(sig, siglen);
+		if (! sigref) {
+			os_log_debug(logsys, "ecdsa_raw_to_der conversion failed");
+			CFRelease(inref);
+			CFRelease(se->key);
+			se->key = NULL;
+			se->state = NO_PENDING;
+			UNLOCK_MUTEX(se->mutex);
+			RET(C_Verify, CKR_SIGNATURE_INVALID);
+		}
+	} else {
+		sigref = CFDataCreateWithBytesNoCopy(NULL, sig, siglen,
+						     kCFAllocatorNull);
+	}
 
 	if (!SecKeyVerifySignature(se->key, se->alg, inref, sigref,
 				   &err)) {
@@ -2737,8 +2969,21 @@ CK_RV C_VerifyFinal(CK_SESSION_HANDLE session, CK_BYTE_PTR sig,
 		goto out;
 	}
 
-	sigdata = CFDataCreateWithBytesNoCopy(NULL, sig, siglen,
-					      kCFAllocatorNull);
+	/*
+	 * PKCS#11 supplies ECDSA signatures as raw r||s; convert to
+	 * Apple's DER format before calling SecKeyVerifySignature.
+	 */
+	if (se->ec_sig) {
+		sigdata = ecdsa_raw_to_der(sig, siglen);
+		if (! sigdata) {
+			os_log_debug(logsys, "ecdsa_raw_to_der conversion failed");
+			rv = CKR_SIGNATURE_INVALID;
+			goto out;
+		}
+	} else {
+		sigdata = CFDataCreateWithBytesNoCopy(NULL, sig, siglen,
+						      kCFAllocatorNull);
+	}
 
 	/*
 	 * At least this is simpler than C_SignFinal.  Finalize the
@@ -3192,10 +3437,12 @@ add_identity(struct slot_entry *entry, CFDictionaryRef dict)
 		}
 	}
 
-	if ( !ret) {
-		ret = SecCertificateCopyPublicKey(id->cert, &id->pubkey);
-		if (ret)
-			LOG_SEC_ERR("CopyPublicKey failed: %{public}@", ret);
+	if (!ret) {
+		id->pubkey = SecCertificateCopyKey(id->cert);
+		if (!id->pubkey) {
+			os_log_debug(logsys, "SecCertificateCopyKey failed");
+			ret = -1;
+		}
 	}
 
 	/*
@@ -3257,6 +3504,13 @@ remove_token_id(CFStringRef tokenid)
 
 	os_log_debug(logsys, "Received removal event for token %{public}@",
 		     tokenid);
+
+	/*
+	 * Guard against callbacks fired after C_Finalize has destroyed
+	 * the mutexes and freed slot_list.
+	 */
+	if (!module_initialized)
+		return;
 
 	LOCK_MUTEX(slot_mutex);
 
@@ -4366,7 +4620,8 @@ build_id_objects(struct slot_entry *entry)
 		SecCertificateRef cert = entry->id_list[i]->cert;
 		CFDataRef subject = NULL, issuer = NULL, serial = NULL;
 		CFDataRef keydata = NULL, modulus = NULL, exponent = NULL;
-		CFErrorRef error;
+		CFDataRef ec_params = NULL, ec_point = NULL;
+		CFErrorRef error = NULL;
 		unsigned char *objid = NULL;
 		unsigned int objidlen;
 
@@ -4450,37 +4705,94 @@ build_id_objects(struct slot_entry *entry)
 			      strlen(entry->id_list[i]->label));
 
 		/*
-		 * It turns out some implementations want CKA_MODULUS_BITS,
-		 * and the modulus and public exponent.  For RSA keys the
-		 * modulus size is equal to the block size, and we can get
-		 * modulus and public exponent from the "external
-		 * representation" of the public key.  Note that the block
-		 * size is returned in bytes, and we need bits.
+		 * Add key-type-specific public key attributes.
+		 *
+		 * For RSA: CKA_MODULUS_BITS, CKA_MODULUS, CKA_PUBLIC_EXPONENT.
+		 * For EC:  CKA_EC_PARAMS (DER curve OID) and CKA_EC_POINT
+		 *          (DER OCTET STRING wrapping the X9.62 public point).
 		 */
-
-		t = SecKeyGetBlockSize(entry->id_list[i]->pubkey) * 8;
-		ADD_ATTR(entry->obj_list, entry->obj_count,
-			 CKA_MODULUS_BITS, t);
 
 		keydata = SecKeyCopyExternalRepresentation(entry->id_list[i]->pubkey,
 							   &error);
 
-		if (keydata) {
-			if (get_pubkey_info(keydata, &modulus, &exponent)) {
-				ADD_ATTR_SIZE(entry->obj_list,
-					      entry->obj_count, CKA_MODULUS,
-					      CFDataGetBytePtr(modulus),
-					      CFDataGetLength(modulus));
+		if (entry->id_list[i]->keytype == CKK_EC) {
+			if (keydata) {
+				size_t bsize = SecKeyGetBlockSize(
+						entry->id_list[i]->pubkey);
+				os_log_error(logsys,
+					     "EC pubkey: keydata len=%ld "
+					     "bsize=%ld",
+					     (long) CFDataGetLength(keydata),
+					     (long) bsize);
+				if (!get_ec_pubkey_info(keydata, bsize,
+							&ec_params, &ec_point)) {
+					os_log_error(logsys,
+						     "get_ec_pubkey_info failed, "
+						     "falling back to cert");
+					get_ec_pubkey_from_cert(
+						entry->id_list[i]->cert,
+						&ec_params, &ec_point);
+				}
+			} else {
+				os_log_error(logsys,
+					     "SecKeyCopyExternalRepresentation "
+					     "failed, falling back to cert");
+				if (error)
+					CFRelease(error);
+				get_ec_pubkey_from_cert(entry->id_list[i]->cert,
+							&ec_params, &ec_point);
+			}
+
+			if (ec_params && ec_point) {
+				os_log_error(logsys,
+					     "EC attrs: params len=%ld "
+					     "point len=%ld",
+					     (long) CFDataGetLength(ec_params),
+					     (long) CFDataGetLength(ec_point));
 				ADD_ATTR_SIZE(entry->obj_list,
 					      entry->obj_count,
-					      CKA_PUBLIC_EXPONENT,
-					      CFDataGetBytePtr(exponent),
-					      CFDataGetLength(exponent));
+					      CKA_EC_PARAMS,
+					      CFDataGetBytePtr(ec_params),
+					      CFDataGetLength(ec_params));
+				ADD_ATTR_SIZE(entry->obj_list,
+					      entry->obj_count,
+					      CKA_EC_POINT,
+					      CFDataGetBytePtr(ec_point),
+					      CFDataGetLength(ec_point));
+			} else {
+				os_log_error(logsys,
+					     "unable to get EC public key "
+					     "attributes for identity");
 			}
 		} else {
-			os_log_debug(logsys, "SecKeyCopyExternalRepresentation "
-				     "failed: %{public}@", error);
-			CFRelease(error);
+			/*
+			 * RSA: modulus size equals block size; extract modulus
+			 * and public exponent from the external representation.
+			 */
+			t = SecKeyGetBlockSize(entry->id_list[i]->pubkey) * 8;
+			ADD_ATTR(entry->obj_list, entry->obj_count,
+				 CKA_MODULUS_BITS, t);
+
+			if (keydata) {
+				if (get_pubkey_info(keydata, &modulus,
+						    &exponent)) {
+					ADD_ATTR_SIZE(entry->obj_list,
+						      entry->obj_count,
+						      CKA_MODULUS,
+						      CFDataGetBytePtr(modulus),
+						      CFDataGetLength(modulus));
+					ADD_ATTR_SIZE(entry->obj_list,
+						      entry->obj_count,
+						      CKA_PUBLIC_EXPONENT,
+						      CFDataGetBytePtr(exponent),
+						      CFDataGetLength(exponent));
+				}
+			} else {
+				os_log_debug(logsys,
+					     "SecKeyCopyExternalRepresentation "
+					     "failed: %{public}@", error);
+				CFRelease(error);
+			}
 		}
 
 		b = CK_FALSE;
@@ -4509,27 +4821,55 @@ build_id_objects(struct slot_entry *entry)
 				      CKA_SUBJECT, CFDataGetBytePtr(subject),
 				      CFDataGetLength(subject));
 
-		label = getkeylabel(entry->id_list[i]->privkey);
+		/*
+		 * Use the identity label (from kSecAttrLabel on the identity
+		 * dict, typically the cert common name) rather than the key's
+		 * own label (kSecAttrLabel on the key, which for CTK tokens
+		 * can differ — e.g. "edgevpn" vs "aleksey.bazhin").
+		 * Consistency across cert, pubkey and privkey objects for the
+		 * same identity is required so that p11tool can locate all
+		 * three objects when given a single URL with object=<label>.
+		 */
 		ADD_ATTR_SIZE(entry->obj_list, entry->obj_count, CKA_LABEL,
-			      label, strlen(label));
-		free(label);
+			      entry->id_list[i]->label,
+			      strlen(entry->id_list[i]->label));
 
 		/*
-		 * I guess some applications want the modulus and public
-		 * exponent as attributes in the private key object.
-		 * Use this information we extracted previously.
+		 * Add key-type-specific private key attributes.
+		 *
+		 * For EC private key objects, CKA_EC_PARAMS identifies the
+		 * curve (same OID as the corresponding public key object).
+		 * For RSA, some applications expect CKA_MODULUS and
+		 * CKA_PUBLIC_EXPONENT on the private key object as well.
 		 */
 
-		if (keydata) {
-			if (modulus)
+		if (entry->id_list[i]->keytype == CKK_EC) {
+			if (ec_params)
 				ADD_ATTR_SIZE(entry->obj_list, entry->obj_count,
-						CKA_MODULUS, CFDataGetBytePtr(modulus),
-						CFDataGetLength(modulus));
-			if (exponent)
+					      CKA_EC_PARAMS,
+					      CFDataGetBytePtr(ec_params),
+					      CFDataGetLength(ec_params));
+			/* OpenSSH requests CKA_EC_POINT from private key objects */
+			if (ec_point)
 				ADD_ATTR_SIZE(entry->obj_list, entry->obj_count,
-						CKA_PUBLIC_EXPONENT,
-						CFDataGetBytePtr(exponent),
-						CFDataGetLength(exponent));
+					      CKA_EC_POINT,
+					      CFDataGetBytePtr(ec_point),
+					      CFDataGetLength(ec_point));
+		} else {
+			if (keydata) {
+				if (modulus)
+					ADD_ATTR_SIZE(entry->obj_list,
+						      entry->obj_count,
+						      CKA_MODULUS,
+						      CFDataGetBytePtr(modulus),
+						      CFDataGetLength(modulus));
+				if (exponent)
+					ADD_ATTR_SIZE(entry->obj_list,
+						      entry->obj_count,
+						      CKA_PUBLIC_EXPONENT,
+						      CFDataGetBytePtr(exponent),
+						      CFDataGetLength(exponent));
+			}
 		}
 
 		b = CK_TRUE;
@@ -4564,6 +4904,10 @@ build_id_objects(struct slot_entry *entry)
 			CFRelease(modulus);
 		if (exponent)
 			CFRelease(exponent);
+		if (ec_params)
+			CFRelease(ec_params);
+		if (ec_point)
+			CFRelease(ec_point);
 	}
 }
 

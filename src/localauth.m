@@ -108,6 +108,13 @@ lacontext_free(void *l)
 {
 	LAContext *lac = (LAContext *) l;
 
+	/*
+	 * Cancel any pending operations before releasing.  This prevents
+	 * LAClient from dispatching async cleanup (error-message formatting,
+	 * CFPreferences lookups) that may fire after our library is
+	 * dlclose()'d and its __DATA pages are unmapped.
+	 */
+	[lac invalidate];
 	[lac release];
 }
 
@@ -150,9 +157,19 @@ lacontext_auth(void *l, unsigned char *bytes, size_t len, void *sec,
 #endif
 	sema = dispatch_semaphore_create(0);
 
+	/*
+	 * Use a heap-allocated string rather than a string literal.
+	 * LAContext retains localizedReason for its lifetime; if it holds
+	 * a pointer to a constant string in our __DATA section, that pointer
+	 * becomes invalid after dlclose() and causes a crash in LAClient's
+	 * async cleanup when it calls isEqual: on the stored string.
+	 */
+	NSString *reason = [[NSString alloc]
+			    initWithUTF8String:"authenticate to your smartcard"];
+
 	[lac evaluateAccessControl: secaccess
 			operation: acc_control
-			localizedReason: @"authenticate to your smartcard"
+			localizedReason: reason
 			reply: ^(BOOL success, NSError *err) {
 				b = success;
 				if (! success) {
@@ -167,6 +184,8 @@ lacontext_auth(void *l, unsigned char *bytes, size_t len, void *sec,
 				}
 				dispatch_semaphore_signal(sema);
 			}];
+
+	[reason release];
 
 	dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
 	dispatch_release(sema);
